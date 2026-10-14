@@ -7,14 +7,15 @@ import asyncio
 import random
 import httpx
 
-
+# Setup logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Sembunyikan log internal MTProtoSender Telethon agar terminal bersih
 logging.getLogger("telethon.network.mtprotosender").setLevel(logging.WARNING)
 logging.getLogger("telethon.network.telegrambarebodysender").setLevel(logging.WARNING)
 
-
+# Load dotenv jika dijalankan secara lokal
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -33,7 +34,7 @@ from telegram.ext import (
     InlineQueryHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
 
-# Config
+# Configuration from Environment Variables
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -44,17 +45,16 @@ BAN_FILE = f"{DATA_DIR}banned.txt"
 USER_FILE = f"{DATA_DIR}users.txt"
 WATCH_FILE = f"{DATA_DIR}watch.txt"
 
-
+# Pengaturan pemantauan (bisa diubah lewat env)
 WATCH_INTERVAL = float(os.getenv("WATCH_INTERVAL", "20"))  # jeda antar putaran (detik)
 WATCH_DELAY_MIN = float(os.getenv("WATCH_DELAY_MIN", "1.0"))  # jeda antar cek username
 WATCH_DELAY_MAX = float(os.getenv("WATCH_DELAY_MAX", "2.0"))
-
+# 0 = rotasi semua akun, 1-20 = pantauan hanya pakai SESSION_n itu saja
 WATCH_ACCOUNT = int(os.getenv("WATCH_ACCOUNT", "0"))
 # 1 = langsung keep (bikin channel publik), 0 = cuma kirim notif
 WATCH_AUTOCLAIM = os.getenv("WATCH_AUTOCLAIM", "0") == "1"
 # 1 = pantau tanpa akun sama sekali (cek halaman t.me lewat HTTP), cuma bisa notif
 WATCH_USE_WEB = os.getenv("WATCH_USE_WEB", "0") == "1"
-WATCH_ACCOUNT = int(os.getenv("WATCH_ACCOUNT", "0"))  # 0 = pakai semua akun, 3 = hanya SESSION_3
 
 BANNED_USERS = set()
 clients = []
@@ -70,7 +70,18 @@ SCAN_CACHE = {}
 # Pantauan aktif: {(mode_key, base): asyncio.Task}
 WATCHERS = {}
 
+# Username valid untuk scan/pantau (cek available): minimal 5 karakter
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_]{4,31}$")
+# Username valid untuk list varian: format tetap valid, tapi tanpa batas minimal huruf
+USERNAME_LOOSE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+def min_base_len(mode_key):
+    """Minimal huruf username dasar untuk scan/pantau (cek available).
+    ganhur & switch = 5, mode lain (penambahan satu huruf dll) = 4."""
+    m = mode_key.split(".")[0]
+    return 5 if m in ("ganhur", "switch") else 4
+
 
 # ================== PERSISTENCE & BAN MANAGEMENT ==================
 def load_users():
@@ -257,16 +268,22 @@ def build_pagination_keyboard(current_page, total_pages, target_base, mode_key):
     return InlineKeyboardMarkup([buttons])
 
 # ================== USERNAME WATCHER (ADMIN ONLY) ==================
-def build_candidates(mode_key, base):
+def build_candidates(mode_key, base, strict=True):
+    """strict=True  -> untuk scan/pantau (cek available): ada minimal huruf
+                       (base min 4, ganhur/switch min 5, hasil min 5 karakter).
+       strict=False -> untuk list varian: tanpa minimal huruf."""
+    if strict and len(base) < min_base_len(mode_key):
+        return []
     gen_func, _ = resolve_mode(mode_key)
     raw = gen_func(base)
     if mode_key == "uncommon":
         raw += gen_canon(base)
+    pattern = USERNAME_RE if strict else USERNAME_LOOSE_RE
     result = []
     for u in sorted(set(raw)):
         if u == base:
             continue
-        if not USERNAME_RE.match(u):
+        if not pattern.match(u):
             continue
         if u.endswith("_") or "__" in u:
             continue
@@ -327,7 +344,11 @@ async def watch_loop(app, mode_key, base):
     claim_fail_notified = set()
 
     if not candidates:
-        await app.bot.send_message(ADMIN_ID, f"❌ Tidak ada variasi valid untuk @{base} ({lbl}).")
+        await app.bot.send_message(
+            ADMIN_ID,
+            f"❌ Tidak ada variasi valid untuk @{base} ({lbl}). "
+            f"Minimal {min_base_len(mode_key)} huruf untuk mode ini."
+        )
         WATCHERS.pop(key, None)
         save_watchlist()
         return
@@ -451,7 +472,11 @@ async def watch_loop_web(app, mode_key, base):
     candidates = build_candidates(mode_key, base)
 
     if not candidates:
-        await app.bot.send_message(ADMIN_ID, f"❌ Tidak ada variasi valid untuk @{base} ({lbl}).")
+        await app.bot.send_message(
+            ADMIN_ID,
+            f"❌ Tidak ada variasi valid untuk @{base} ({lbl}). "
+            f"Minimal {min_base_len(mode_key)} huruf untuk mode ini."
+        )
         WATCHERS.pop(key, None)
         save_watchlist()
         return
@@ -568,7 +593,8 @@ async def pantau_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Contoh: /pantau tamping adnan\n"
             "Mode: " + ", ".join(GENERATORS.keys()) + "\n"
             "Pilihan huruf (tamping/tamhur/tamdal): rata, tidakrata, vokal, cadel\n"
-            "Contoh: /pantau tamping rata adnan"
+            "Contoh: /pantau tamping rata adnan\n"
+            "Minimal huruf: ganhur & switch 5, mode lain 4"
         )
         return
 
@@ -578,6 +604,14 @@ async def pantau_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if WATCH_ACCOUNT and not any(client_acc.get(c) == WATCH_ACCOUNT for c in clients):
         await update.message.reply_text(f"❌ SESSION_{WATCH_ACCOUNT} tidak aktif / gagal login.")
+        return
+
+    min_len = min_base_len(mode_key)
+    if len(base) < min_len:
+        await update.message.reply_text(
+            f"❌ @{base} cuma {len(base)} huruf. "
+            f"Mode {mode_key.replace('.', ' ')} butuh minimal {min_len} huruf."
+        )
         return
 
     total = len(build_candidates(mode_key, base))
@@ -626,25 +660,43 @@ async def daftar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=markup)
 
 # ================== DAFTAR VARIAN (INLINE) ==================
-VL_PAGE_SIZE = 15
+# Batas karakter isi per halaman (limit Telegram 4096, sisanya buat header).
+# Username disambung dengan spasi tanpa \n, jadi base pendek = banyak per halaman,
+# base panjang = lebih sedikit per halaman.
+VL_CHAR_BUDGET = 3500
+
+def paginate_variants(items):
+    """Bagi varian ke halaman-halaman berdasarkan total karakter, bukan jumlah tetap."""
+    pages, cur, cur_len = [], [], 0
+    for u in items:
+        add = len(u) + 2  # "@" + username + spasi pemisah
+        if cur and cur_len + add > VL_CHAR_BUDGET:
+            pages.append(cur)
+            cur, cur_len = [], 0
+        cur.append(u)
+        cur_len += add
+    if cur:
+        pages.append(cur)
+    return pages
 
 def render_variant_page(mode_key, base, page):
-    """Return (text, markup, jumlah_varian). Tanpa cek available, cuma menampilkan semua varian."""
-    items = build_candidates(mode_key, base)
+    """Return (text, markup, jumlah_varian). Tanpa cek available dan tanpa minimal huruf.
+    Semua varian disambung dengan spasi (tanpa \\n) biar hemat halaman."""
+    items = build_candidates(mode_key, base, strict=False)
     lbl = resolve_mode(mode_key)[1]
     if not items:
-        return f"tidak ada varian valid untuk @{base} ({lbl}), username minimal 5 huruf", None, 0
+        return f"tidak ada varian valid untuk @{base} ({lbl})", None, 0
 
-    total_pages = -(-len(items) // VL_PAGE_SIZE)
+    pages = paginate_variants(items)
+    total_pages = len(pages)
     page = min(max(page, 0), total_pages - 1)
-    chunk = items[page * VL_PAGE_SIZE:(page + 1) * VL_PAGE_SIZE]
-    # teks polos (tanpa Markdown), jadi "@username" tampil apa adanya
-    rows = [f"@{u}" for u in chunk]
+    # teks polos (tanpa Markdown), disambung spasi biasa
+    body = " ".join(f"@{u}" for u in pages[page])
 
     header = f"varian @{base} ({lbl}) ada {len(items)} usn"
     if total_pages > 1:
         header += f"\n{page + 1}/{total_pages}"
-    text = header + "\n\n" + "\n".join(rows)
+    text = header + "\n\n" + body
     return text, variant_keyboard(mode_key, base, page, total_pages), len(items)
 
 def variant_keyboard(mode_key, base, page, total_pages):
@@ -728,30 +780,44 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     mode_label = resolve_mode(mode_key)[1]
 
-    loading_text = f"Klik tombol di bawah untuk mulai scan @{base} ({mode_label})..."
+    min_len = min_base_len(mode_key)
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Mulai Scan", callback_data=f"runlive_{mode_key}_{base}")
-    ]])
+    if len(base) >= min_len:
+        loading_text = f"Klik tombol di bawah untuk mulai scan @{base} ({mode_label})..."
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Mulai Scan", callback_data=f"runlive_{mode_key}_{base}")
+        ]])
+        results = [
+            InlineQueryResultArticle(
+                id=f"s{int(time.time())}",
+                title=f"List @{base} ({mode_label})",
+                description=f"Scan list username @{base} (bukan username checker)",
+                input_message_content=InputTextMessageContent(loading_text),
+                reply_markup=keyboard
+            )
+        ]
+    else:
+        # Terlalu pendek untuk cek available, list varian di bawah tetap bisa
+        results = [
+            InlineQueryResultArticle(
+                id=f"m{int(time.time())}",
+                title=f"Scan tidak tersedia (min {min_len} huruf)",
+                description=f"@{base} cuma {len(base)} huruf, scan {mode_label} butuh minimal {min_len}. List varian tetap bisa.",
+                input_message_content=InputTextMessageContent(
+                    f"Scan {mode_label} butuh username minimal {min_len} huruf. "
+                    f"@{base} cuma {len(base)} huruf."
+                )
+            )
+        ]
 
-    results = [
-        InlineQueryResultArticle(
-            id=f"s{int(time.time())}",
-            title=f"Scan @{base} ({mode_label})",
-            description=f"Scan variasi username @{base}",
-            input_message_content=InputTextMessageContent(loading_text),
-            reply_markup=keyboard
-        )
-    ]
-
-    # Daftar semua varian (tanpa cek available)
+    # Daftar semua varian (tanpa cek available, tanpa minimal huruf)
     list_text, list_markup, n_items = render_variant_page(mode_key, base, 0)
     if n_items:
         results.append(
             InlineQueryResultArticle(
                 id=f"l{int(time.time())}",
                 title=f"Varian {base} ({mode_label})",
-                description=f"Tampilkan {n_items} varian username",
+                description=f"Tampilkan list {n_items} varian username",
                 input_message_content=InputTextMessageContent(list_text),
                 reply_markup=list_markup
             )
@@ -833,12 +899,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        gen_func, lbl = resolve_mode(mode_key) or (gen_tamhur, "tamhur")
-        raw_res = gen_func(base)
-        if mode_key == "uncommon":
-            raw_res += gen_canon(base)
+        _, lbl = resolve_mode(mode_key) or (gen_tamhur, "tamhur")
+        # Scan cek available: ada minimal huruf (base 4, ganhur/switch 5)
+        candidates = build_candidates(mode_key, base)[:100]
+        if not candidates:
+            await context.bot.edit_message_text(
+                inline_message_id=inline_msg_id,
+                text=f"❌ @{base} terlalu pendek untuk scan {lbl}, minimal {min_base_len(mode_key)} huruf"
+            )
+            return
 
-        candidates = list(set(raw_res))[:100]
         found_avail = []
         last_update_time = time.time()
 
@@ -1012,7 +1082,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         if "reply_to" in context.user_data:
             target_id = int(context.user_data.pop("reply_to"))
             try:
-                await context.bot.send_message(chat_id=target_id, text=f"{msg_text}", parse_mode="Markdown")
+                await context.bot.send_message(chat_id=target_id, text=f"💬 **Pesan dari Admin:**\n{msg_text}", parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Balasan berhasil dikirim ke `{target_id}`", parse_mode="Markdown")
             except Exception as e:
                 await update.message.reply_text(f"❌ Gagal mengirim pesan ke user: {e}")
@@ -1025,7 +1095,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 try:
                     # Ambil User ID dari teks notifikasi
                     target_id = int(rep_text.split("ID:")[1].split()[0].replace("`", ""))
-                    await context.bot.send_message(chat_id=target_id, text=f"{msg_text}", parse_mode="Markdown")
+                    await context.bot.send_message(chat_id=target_id, text=f"💬 **Pesan dari Admin:**\n{msg_text}", parse_mode="Markdown")
                     await update.message.reply_text(f"✅ Balasan berhasil dikirim ke `{target_id}`", parse_mode="Markdown")
                     return
                 except Exception as e:
@@ -1056,6 +1126,44 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("...")
     except Exception as e:
         logger.error(f"Gagal: {e}")
+
+# ================== PANTAU REPLY DI GRUP (HASIL INLINE BOT) ==================
+async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+
+    replied = msg.reply_to_message
+    # hanya tangkap reply ke pesan yang dikirim via bot ini
+    if not replied.via_bot or replied.via_bot.id != context.bot.id:
+        return
+
+    user = msg.from_user
+    if user.id in BANNED_USERS:
+        return
+
+    chat = msg.chat
+    chat_name = chat.title or chat.username or str(chat.id)
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    username = f"@{user.username}" if user.username else "tanpa username"
+
+    # teks asli pesan inline yang dibalas
+    original_text = replied.text or replied.caption or "(bukan teks)"
+    reply_text = msg.text or msg.caption or "(bukan teks)"
+
+    notif = (
+        f"\U0001f4ac **Reply ke pesan bot (GC)**\n"
+        f"\u2022 Grup: {chat_name}\n"
+        f"\u2022 Dari: {full_name} ({username})\n"
+        f"\u2022 ID: `{user.id}`\n\n"
+        f"\U0001f4c4 **Pesan asli:**\n{original_text[:200]}\n\n"
+        f"\u21a9\ufe0f **Reply-nya:**\n{reply_text[:500]}"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=notif, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Gagal kirim notif reply GC: {e}")
 
 # ================== POST INIT & MAIN ==================
 async def post_init(application):
@@ -1094,6 +1202,13 @@ def main():
 
     # Handler pesan PM/PC (Private Chat)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message))
+
+    # Tangkap reply ke pesan inline di grup
+    app.add_handler(MessageHandler(
+        (filters.ChatType.GROUPS) & filters.TEXT & filters.REPLY & ~filters.COMMAND,
+        handle_group_reply
+    ))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.REPLY & ~filters.COMMAND, handle_group_reply))
 
     logger.info("🚀 Bot berjalan...")
     app.run_polling(drop_pending_updates=True)
