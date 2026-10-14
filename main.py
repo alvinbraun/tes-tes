@@ -778,7 +778,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineQueryResultArticle(
                 id="info",
                 title="⚠️ hi",
-                description="bot ini khusus gw dan temen temen gw, selain itu gw ban",
+                description="iya hi",
                 input_message_content=InputTextMessageContent(
                     "@rsunless's"
                 )
