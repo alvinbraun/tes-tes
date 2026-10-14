@@ -791,7 +791,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineQueryResultArticle(
                 id=f"s{int(time.time())}",
                 title=f"List @{base} ({mode_label})",
-                description=f"Scan list username @{base} (bukan username checker)",
+                description=f"Scan username @{base}",
                 input_message_content=InputTextMessageContent(loading_text),
                 reply_markup=keyboard
             )
@@ -817,7 +817,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineQueryResultArticle(
                 id=f"l{int(time.time())}",
                 title=f"Varian {base} ({mode_label})",
-                description=f"Tampilkan list {n_items} varian username",
+                description=f"Tampilkan list {n_items} varian username (bukan username checker)",
                 input_message_content=InputTextMessageContent(list_text),
                 reply_markup=list_markup
             )
