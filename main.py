@@ -1,19 +1,20 @@
 import os
+import re
 import string
 import time
 import logging
 import asyncio
 import random
+import httpx
 
-# Setup logging
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Sembunyikan log internal MTProtoSender Telethon agar terminal bersih
 logging.getLogger("telethon.network.mtprotosender").setLevel(logging.WARNING)
 logging.getLogger("telethon.network.telegrambarebodysender").setLevel(logging.WARNING)
 
-# Load dotenv jika dijalankan secara lokal
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -28,28 +29,48 @@ from telegram import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, 
+    ApplicationBuilder, CommandHandler,
     InlineQueryHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
 
-# Configuration from Environment Variables
+# Config
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-DATA_DIR = "./" 
+DATA_DIR = "./"
 BAN_FILE = f"{DATA_DIR}banned.txt"
 USER_FILE = f"{DATA_DIR}users.txt"
+WATCH_FILE = f"{DATA_DIR}watch.txt"
+
+
+WATCH_INTERVAL = float(os.getenv("WATCH_INTERVAL", "20"))  # jeda antar putaran (detik)
+WATCH_DELAY_MIN = float(os.getenv("WATCH_DELAY_MIN", "1.0"))  # jeda antar cek username
+WATCH_DELAY_MAX = float(os.getenv("WATCH_DELAY_MAX", "2.0"))
+
+WATCH_ACCOUNT = int(os.getenv("WATCH_ACCOUNT", "0"))
+# 1 = langsung keep (bikin channel publik), 0 = cuma kirim notif
+WATCH_AUTOCLAIM = os.getenv("WATCH_AUTOCLAIM", "0") == "1"
+# 1 = pantau tanpa akun sama sekali (cek halaman t.me lewat HTTP), cuma bisa notif
+WATCH_USE_WEB = os.getenv("WATCH_USE_WEB", "0") == "1"
+WATCH_ACCOUNT = int(os.getenv("WATCH_ACCOUNT", "0"))  # 0 = pakai semua akun, 3 = hanya SESSION_3
 
 BANNED_USERS = set()
 clients = []
+CLIENT_BY_SLOT = {}
 client_cooldown = {}
+client_acc = {}
 client_index = 0
 ALL_USERS = set()
 
 # Cache sementara hasil scan per inline message id
 SCAN_CACHE = {}
+
+# Pantauan aktif: {(mode_key, base): asyncio.Task}
+WATCHERS = {}
+
+USERNAME_RE = re.compile(r"^[a-z][a-z0-9_]{4,31}$")
 
 # ================== PERSISTENCE & BAN MANAGEMENT ==================
 def load_users():
@@ -83,17 +104,36 @@ def remove_ban(user_id):
             for uid in BANNED_USERS:
                 f.write(f"{uid}\n")
 
+def save_watchlist():
+    try:
+        with open(WATCH_FILE, "w") as f:
+            for (mode_key, base) in WATCHERS:
+                f.write(f"{mode_key}|{base}\n")
+    except Exception as e:
+        logger.error(f"Gagal menyimpan watchlist: {e}")
+
+def load_watchlist():
+    items = []
+    if os.path.exists(WATCH_FILE):
+        with open(WATCH_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if "|" in line:
+                    mode_key, base = line.split("|", 1)
+                    items.append((mode_key, base))
+    return items
+
 # ================== NOTIFY ADMIN ==================
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, user, action_type: str, details: str = ""):
     if not ADMIN_ID:
         return
-    
+
     first_name = user.first_name or ""
     last_name = user.last_name or ""
     full_name = f"{first_name} {last_name}".strip()
     username = f"@{user.username}" if user.username else "Tidak ada username"
     user_id = user.id
-    
+
     text = (
         f"👤 **Aktivitas Pengguna**\n"
         f"• Aksi: {action_type}\n"
@@ -103,7 +143,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, user, action_type: st
     )
     if details:
         text += f"\n• **Detail:** `{details}`"
-        
+
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
     except Exception as e:
@@ -112,8 +152,10 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, user, action_type: st
 # ================== GENERATORS ==================
 rata, tdk_rata, vokal = "asweruiozxcvnm", "qtypdfghjklb", "aeiou"
 
-def gen_tamhur(b): return list({b[:i] + l + b[i:] for i in range(len(b)+1) for l in string.ascii_lowercase})
-def gen_tamping(b): return list({l + b for l in string.ascii_lowercase} | {b + l for l in string.ascii_lowercase})
+def gen_tamhur(b, letters=string.ascii_lowercase): return list({b[:i] + l + b[i:] for i in range(len(b)+1) for l in letters})
+def gen_tamping(b, letters=string.ascii_lowercase): return list({l + b for l in letters} | {b + l for l in letters})
+# tamdal = tambah dalam: huruf disisipkan di antara huruf lain, bukan di depan/belakang
+def gen_tamdal(b, letters=string.ascii_lowercase): return list({b[:i] + l + b[i:] for i in range(1, len(b)) for l in letters})
 def gen_switch(b):
     res = set()
     for i in range(len(b) - 1):
@@ -135,6 +177,7 @@ GENERATORS = {
     "switch": (gen_switch, "switch"),
     "tamping": (gen_tamping, "tamping"),
     "tamhur": (gen_tamhur, "tamhur"),
+    "tamdal": (gen_tamdal, "tamdal"),
     "ganhur": (gen_ganhur, "ganhur"),
     "uncommon": (gen_uncommon, "uncommon"),
     "kurhur": (gen_kurhur, "kurhur"),
@@ -143,9 +186,33 @@ GENERATORS = {
     "vokal": (gen_vokal, "vokal"),
 }
 
+# Pilihan set huruf untuk mode tamping / tamhur / tamdal
+LETTER_SETS = {
+    "rata": rata,
+    "tidakrata": tdk_rata,
+    "vokal": vokal,
+    "cadel": "wycl",
+}
+LETTER_LABELS = {"all": "semua", "rata": "rata", "tidakrata": "tidak rata", "vokal": "vokal", "cadel": "cadel"}
+LETTER_MODES = ("tamping", "tamhur", "tamdal")
+
+def resolve_mode(mode_key):
+    """'tamping' atau 'tamping.rata' -> (fungsi_generator, label). None kalau tidak valid."""
+    if "." in mode_key:
+        m, ls = mode_key.split(".", 1)
+        if m in LETTER_MODES and ls in LETTER_SETS:
+            func, mlabel = GENERATORS[m]
+            letters = LETTER_SETS[ls]
+            return (lambda b, _f=func, _l=letters: _f(b, _l)), f"{mlabel} {LETTER_LABELS[ls]}"
+        return None
+    return GENERATORS.get(mode_key)
+
+def is_valid_mode(mode_key):
+    return resolve_mode(mode_key) is not None
+
 # ================== CORE LOGIC ==================
 async def init_clients():
-    if not API_ID or not API_HASH: 
+    if not API_ID or not API_HASH:
         logger.error("❌ API_ID atau API_HASH kosong!")
         return
     for i in range(1, 21):
@@ -157,11 +224,13 @@ async def init_clients():
             await c.connect()
             if await c.is_user_authorized():
                 clients.append(c)
+                CLIENT_BY_SLOT[i] = c
                 client_cooldown[c] = 0
+                client_acc[c] = i
                 logger.info(f"✅ acc{i} (StringSession) Ready")
-            else: 
+            else:
                 await c.disconnect()
-        except Exception as e: 
+        except Exception as e:
             logger.debug(f"Gagal memuat SESSION_{i}: {e}")
 
 def get_available_client():
@@ -179,13 +248,443 @@ def chunk_results(items, chunk_size=15):
 def build_pagination_keyboard(current_page, total_pages, target_base, mode_key):
     if total_pages <= 1:
         return None
-    
+
     buttons = []
     for i in range(total_pages):
         label = f"• {i+1} •" if i == current_page else f"{i+1}"
         buttons.append(InlineKeyboardButton(label, callback_data=f"page_{mode_key}_{target_base}_{i}"))
-    
+
     return InlineKeyboardMarkup([buttons])
+
+# ================== USERNAME WATCHER (ADMIN ONLY) ==================
+def build_candidates(mode_key, base):
+    gen_func, _ = resolve_mode(mode_key)
+    raw = gen_func(base)
+    if mode_key == "uncommon":
+        raw += gen_canon(base)
+    result = []
+    for u in sorted(set(raw)):
+        if u == base:
+            continue
+        if not USERNAME_RE.match(u):
+            continue
+        if u.endswith("_") or "__" in u:
+            continue
+        result.append(u)
+    return result
+
+async def wait_client():
+    while True:
+        if WATCH_ACCOUNT:
+            c = next((x for x in clients if client_acc.get(x) == WATCH_ACCOUNT), None)
+            if c and client_cooldown[c] <= time.time():
+                return c
+        else:
+            c = get_available_client()
+            if c:
+                return c
+        await asyncio.sleep(5)
+
+async def wait_watch_client():
+    """Kalau WATCH_ACCOUNT diisi, selalu pakai akun itu (nunggu kalau lagi cooldown)."""
+    if WATCH_ACCOUNT:
+        c = CLIENT_BY_SLOT.get(WATCH_ACCOUNT)
+        if c:
+            while client_cooldown[c] > time.time():
+                await asyncio.sleep(5)
+            return c
+        logger.warning(f"WATCH_ACCOUNT={WATCH_ACCOUNT} tidak aktif, pakai rotasi akun.")
+    return await wait_client()
+
+async def claim_username(c, u):
+    """Keep username: bikin channel publik dengan username tsb di akun c."""
+    ch = None
+    try:
+        res = await c(functions.channels.CreateChannelRequest(
+            title=u, about="", broadcast=True
+        ))
+        ch = res.chats[0]
+        await c(functions.channels.UpdateUsernameRequest(channel=ch, username=u))
+        return True, ""
+    except FloodWaitError as e:
+        client_cooldown[c] = time.time() + e.seconds + 5
+        err = f"FloodWait {e.seconds}s"
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+
+    # Gagal set username -> hapus channel kosong yang sempat dibuat
+    if ch is not None:
+        try:
+            await c(functions.channels.DeleteChannelRequest(channel=ch))
+        except Exception:
+            pass
+    return False, err
+
+async def watch_loop(app, mode_key, base):
+    key = (mode_key, base)
+    lbl = resolve_mode(mode_key)[1]
+    candidates = build_candidates(mode_key, base)
+    claim_fail_notified = set()
+
+    if not candidates:
+        await app.bot.send_message(ADMIN_ID, f"❌ Tidak ada variasi valid untuk @{base} ({lbl}).")
+        WATCHERS.pop(key, None)
+        save_watchlist()
+        return
+
+    logger.info(f"👁️ Mulai memantau @{base} ({lbl}) - {len(candidates)} variasi")
+
+    try:
+        while True:
+            if not clients:
+                await asyncio.sleep(30)
+                continue
+
+            for u in candidates:
+                available = False
+                # cek satu username, ulangi kalau akun kena limit
+                for _ in range(5):
+                    c = await wait_watch_client()
+                    try:
+                        available = await asyncio.wait_for(
+                            c(functions.account.CheckUsernameRequest(u)), timeout=8.0
+                        )
+                        break
+                    except FloodWaitError as e:
+                        logger.warning(f"⚠️ FloodWait {e.seconds}s (watch @{base})")
+                        client_cooldown[c] = time.time() + e.seconds + 5
+                        continue
+                    except asyncio.TimeoutError:
+                        client_cooldown[c] = time.time() + 10
+                        continue
+                    except Exception:
+                        available = False
+                        break
+
+                if available and not WATCH_AUTOCLAIM:
+                    await app.bot.send_message(
+                        ADMIN_ID,
+                        f"🟢 @{u} available!\n"
+                        f"Dari pantauan: {lbl} {base}\n"
+                        f"Buruan ambil. Pantauan ini dihentikan."
+                    )
+                    WATCHERS.pop(key, None)
+                    save_watchlist()
+                    return
+
+                if available:
+                    ok, err = await claim_username(c, u)
+                    acc_no = client_acc.get(c, "?")
+                    if ok:
+                        await app.bot.send_message(
+                            ADMIN_ID,
+                            f"✅ Berhasil keep @{u}\n"
+                            f"Dari pantauan: {lbl} {base}\n"
+                            f"Akun: acc{acc_no} (dibuat sebagai channel publik)\n"
+                            f"Pantauan ini dihentikan."
+                        )
+                        WATCHERS.pop(key, None)
+                        save_watchlist()
+                        return
+                    else:
+                        logger.warning(f"Gagal keep @{u}: {err}")
+                        if u not in claim_fail_notified:
+                            claim_fail_notified.add(u)
+                            await app.bot.send_message(
+                                ADMIN_ID,
+                                f"⚠️ @{u} available tapi gagal di-keep oleh acc{acc_no}.\n"
+                                f"Alasan: {err}\n"
+                                f"Pantauan tetap jalan."
+                            )
+
+                await asyncio.sleep(random.uniform(WATCH_DELAY_MIN, WATCH_DELAY_MAX))
+
+            await asyncio.sleep(WATCH_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info(f"🛑 Pantauan @{base} ({lbl}) dibatalkan")
+        raise
+    except Exception as e:
+        logger.error(f"Watcher @{base} ({lbl}) error: {e}")
+        WATCHERS.pop(key, None)
+        save_watchlist()
+        try:
+            await app.bot.send_message(ADMIN_ID, f"❌ Pantauan {lbl} {base} berhenti karena error: {e}")
+        except Exception:
+            pass
+
+# ---------- Mode web (tanpa akun) ----------
+WEB_CLIENT = None
+
+def get_web_client():
+    global WEB_CLIENT
+    if WEB_CLIENT is None:
+        WEB_CLIENT = httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"},
+        )
+    return WEB_CLIENT
+
+async def check_web(u):
+    """Cek lewat halaman t.me/<u>.
+    Return: 'free' (kelihatannya kosong), 'taken' (ada pemiliknya),
+    'limit' (kena rate limit), 'unknown' (gagal / halaman tidak jelas)."""
+    try:
+        r = await get_web_client().get(f"https://t.me/{u}")
+    except Exception:
+        return "unknown"
+    if r.status_code == 429:
+        return "limit"
+    if r.status_code != 200:
+        return "unknown"
+    html = r.text
+    if "tgme" not in html:
+        return "unknown"
+    # username yang dipakai punya blok nama/foto profil, yang kosong tidak
+    if "tgme_page_title" in html or "tgme_page_photo" in html:
+        return "taken"
+    return "free"
+
+async def watch_loop_web(app, mode_key, base):
+    key = (mode_key, base)
+    lbl = resolve_mode(mode_key)[1]
+    candidates = build_candidates(mode_key, base)
+
+    if not candidates:
+        await app.bot.send_message(ADMIN_ID, f"❌ Tidak ada variasi valid untuk @{base} ({lbl}).")
+        WATCHERS.pop(key, None)
+        save_watchlist()
+        return
+
+    logger.info(f"🌐 Mulai memantau (web) @{base} ({lbl}) - {len(candidates)} variasi")
+
+    try:
+        while True:
+            for u in candidates:
+                state = "unknown"
+                for _ in range(3):
+                    state = await check_web(u)
+                    if state != "limit":
+                        break
+                    logger.warning("⚠️ t.me rate limit, nunggu 60 detik")
+                    await asyncio.sleep(60)
+
+                if state == "free":
+                    # cek ulang sekali biar tidak salah notif
+                    await asyncio.sleep(random.uniform(2, 4))
+                    if await check_web(u) == "free":
+                        await app.bot.send_message(
+                            ADMIN_ID,
+                            f"🟢 @{u} kelihatannya available!\n"
+                            f"Dari pantauan: {lbl} {base}\n"
+                            f"(dicek lewat web, belum tentu bisa diambil, coba langsung)\n"
+                            f"Pantauan ini dihentikan."
+                        )
+                        WATCHERS.pop(key, None)
+                        save_watchlist()
+                        return
+
+                await asyncio.sleep(random.uniform(WATCH_DELAY_MIN, WATCH_DELAY_MAX))
+
+            await asyncio.sleep(WATCH_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info(f"🛑 Pantauan (web) @{base} ({lbl}) dibatalkan")
+        raise
+    except Exception as e:
+        logger.error(f"Watcher web @{base} ({lbl}) error: {e}")
+        WATCHERS.pop(key, None)
+        save_watchlist()
+        try:
+            await app.bot.send_message(ADMIN_ID, f"❌ Pantauan {lbl} {base} berhenti karena error: {e}")
+        except Exception:
+            pass
+
+async def cek_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cek <username> : tes hasil cek web (dan bandingkan dengan akun kalau ada)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /cek <username>")
+        return
+    u = context.args[0].lower().lstrip("@")
+    text = f"Web (t.me): {await check_web(u)}"
+    if clients:
+        c = get_available_client()
+        if c:
+            try:
+                ok = await asyncio.wait_for(c(functions.account.CheckUsernameRequest(u)), timeout=8.0)
+                text += f"\nAkun: {'available' if ok else 'tidak available'}"
+            except Exception as e:
+                text += f"\nAkun: error {type(e).__name__}"
+    await update.message.reply_text(text)
+
+def start_watch(app, mode_key, base):
+    key = (mode_key, base)
+    task = WATCHERS.get(key)
+    if task and not task.done():
+        return False
+    loop_fn = watch_loop_web if WATCH_USE_WEB else watch_loop
+    WATCHERS[key] = asyncio.create_task(loop_fn(app, mode_key, base))
+    save_watchlist()
+    return True
+
+def cancel_watch(mode_key, base):
+    task = WATCHERS.pop((mode_key, base), None)
+    save_watchlist()
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+def render_watch_list():
+    if not WATCHERS:
+        return "Belum ada username yang dipantau.", None
+    lines = [f"• {m.replace('.', ' ')} {b}" for (m, b) in WATCHERS]
+    kb = [
+        [InlineKeyboardButton(f"❌ Batal {m.replace('.', ' ')} {b}", callback_data=f"stopwatch_{m}_{b}")]
+        for (m, b) in WATCHERS
+    ]
+    return "Sedang dipantau:\n" + "\n".join(lines), InlineKeyboardMarkup(kb)
+
+def parse_mode_base(args):
+    """['tamping','rata','adnan'] -> ('tamping.rata','adnan'); ['tamping','adnan'] -> ('tamping','adnan');
+    ['adnan'] -> ('tamhur','adnan')"""
+    args = [a.lower().lstrip("@") for a in args if a]
+    if not args:
+        return None, None
+    if len(args) >= 3 and args[0] in LETTER_MODES and args[1] in LETTER_SETS:
+        return f"{args[0]}.{args[1]}", args[2]
+    if len(args) >= 2 and is_valid_mode(args[0]):
+        return args[0], args[1]
+    return "tamhur", args[0]
+
+async def pantau_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    mode_key, base = parse_mode_base(context.args)
+    if not base:
+        await update.message.reply_text(
+            "Format: /pantau <mode> <username>\n"
+            "Contoh: /pantau tamping adnan\n"
+            "Mode: " + ", ".join(GENERATORS.keys()) + "\n"
+            "Pilihan huruf (tamping/tamhur/tamdal): rata, tidakrata, vokal, cadel\n"
+            "Contoh: /pantau tamping rata adnan"
+        )
+        return
+
+    if not clients and not WATCH_USE_WEB:
+        await update.message.reply_text("❌ Belum ada akun Telethon yang aktif.")
+        return
+
+    if WATCH_ACCOUNT and not any(client_acc.get(c) == WATCH_ACCOUNT for c in clients):
+        await update.message.reply_text(f"❌ SESSION_{WATCH_ACCOUNT} tidak aktif / gagal login.")
+        return
+
+    total = len(build_candidates(mode_key, base))
+    if total == 0:
+        await update.message.reply_text("❌ Tidak ada variasi valid dari input itu.")
+        return
+
+    if start_watch(context.application, mode_key, base):
+        await update.message.reply_text(
+            f"👁️ Mulai memantau {mode_key.replace('.', ' ')} {base} ({total} variasi).\n"
+            f"Kalau ada yang available {'langsung dikeep' if (WATCH_AUTOCLAIM and not WATCH_USE_WEB) else 'kamu dapat notif'}.\n"
+            f"Batalin: /batal {mode_key.replace('.', ' ')} {base}"
+        )
+    else:
+        await update.message.reply_text(f"{mode_key.replace('.', ' ')} {base} sudah dipantau.")
+
+async def batal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if context.args and context.args[0].lower() == "semua":
+        n = 0
+        for (m, b) in list(WATCHERS.keys()):
+            if cancel_watch(m, b):
+                n += 1
+        await update.message.reply_text(f"✅ {n} pantauan dibatalkan.")
+        return
+
+    mode_key, base = parse_mode_base(context.args)
+    if not base:
+        await update.message.reply_text(
+            "Format: /batal <mode> <username>\n"
+            "Contoh: /batal tamping adnan\n"
+            "Atau /batal semua, atau lihat /daftar"
+        )
+        return
+
+    if cancel_watch(mode_key, base):
+        await update.message.reply_text(f"✅ Pantauan {mode_key.replace('.', ' ')} {base} dibatalkan.")
+    else:
+        await update.message.reply_text(f"Tidak ada pantauan {mode_key.replace('.', ' ')} {base}.")
+
+async def daftar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    text, markup = render_watch_list()
+    await update.message.reply_text(text, reply_markup=markup)
+
+# ================== DAFTAR VARIAN (INLINE) ==================
+VL_PAGE_SIZE = 15
+
+def render_variant_page(mode_key, base, page):
+    """Return (text, markup, jumlah_varian). Tanpa cek available, cuma menampilkan semua varian."""
+    items = build_candidates(mode_key, base)
+    lbl = resolve_mode(mode_key)[1]
+    if not items:
+        return f"tidak ada varian valid untuk @{base} ({lbl}), username minimal 5 huruf", None, 0
+
+    total_pages = -(-len(items) // VL_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    chunk = items[page * VL_PAGE_SIZE:(page + 1) * VL_PAGE_SIZE]
+    # teks polos (tanpa Markdown), jadi "@username" tampil apa adanya
+    rows = [f"@{u}" for u in chunk]
+
+    header = f"varian @{base} ({lbl}) ada {len(items)} usn"
+    if total_pages > 1:
+        header += f"\n{page + 1}/{total_pages}"
+    text = header + "\n\n" + "\n".join(rows)
+    return text, variant_keyboard(mode_key, base, page, total_pages), len(items)
+
+def variant_keyboard(mode_key, base, page, total_pages):
+    rows = []
+    if total_pages > 1:
+        def pbtn(label, i):
+            data = f"vl_{mode_key}_{base}_{i}"
+            if len(data.encode()) > 64:
+                return None
+            return InlineKeyboardButton(label, callback_data=data)
+
+        if total_pages <= 10:
+            btns = [pbtn(f"• {i + 1} •" if i == page else f"{i + 1}", i) for i in range(total_pages)]
+            btns = [b for b in btns if b]
+            for i in range(0, len(btns), 5):
+                rows.append(btns[i:i + 5])
+        else:
+            nav = [
+                pbtn("« 1", 0),
+                pbtn("‹", max(page - 1, 0)),
+                pbtn(f"{page + 1}/{total_pages}", page),
+                pbtn("›", min(page + 1, total_pages - 1)),
+                pbtn(f"{total_pages} »", total_pages - 1),
+            ]
+            rows.append([b for b in nav if b])
+
+    base_mode = mode_key.split(".")[0]
+    if base_mode in LETTER_MODES:
+        cur = mode_key.split(".")[1] if "." in mode_key else "all"
+        fbtns = []
+        for key, label in LETTER_LABELS.items():
+            target = base_mode if key == "all" else f"{base_mode}.{key}"
+            data = f"vl_{target}_{base}_0"
+            if len(data.encode()) > 64:
+                continue
+            fbtns.append(InlineKeyboardButton(f"• {label} •" if key == cur else label, callback_data=data))
+        for i in range(0, len(fbtns), 2):
+            rows.append(fbtns[i:i + 2])
+
+    return InlineKeyboardMarkup(rows) if rows else None
 
 # ================== INLINE HANDLER ==================
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,23 +714,19 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 input_message_content=InputTextMessageContent(
                     "Contoh penggunaan:\n"
                     " @sunless2bot adnan\n"
-                    " @sunless2bot uncommon adnan"
+                    " @sunless2bot uncommon adnan\n"
+                    " @sunless2bot tamdal adnan\n"
+                    " @sunless2bot tamping rata adnan"
                 )
             )
         ]
         await update.inline_query.answer(results, cache_time=1)
         return
 
-    parts = query.split(maxsplit=1)
-    
-    if parts[0].lower() in GENERATORS and len(parts) > 1:
-        mode_key = parts[0].lower()
-        base = parts[1].replace("@", "").strip()
-        mode_label = GENERATORS[mode_key][1]
-    else:
-        mode_key = "tamhur"
-        base = query.replace("@", "").strip()
-        mode_label = "tamhur"
+    mode_key, base = parse_mode_base(query.replace("@", " ").split())
+    if not base:
+        return
+    mode_label = resolve_mode(mode_key)[1]
 
     loading_text = f"Klik tombol di bawah untuk mulai scan @{base} ({mode_label})..."
 
@@ -241,14 +736,27 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = [
         InlineQueryResultArticle(
-            id=f"scan_{mode_key}_{base}_{int(time.time())}",
+            id=f"s{int(time.time())}",
             title=f"Scan @{base} ({mode_label})",
-            description=f"Langsung scan variasi username @{base}",
+            description=f"Scan variasi username @{base}",
             input_message_content=InputTextMessageContent(loading_text),
             reply_markup=keyboard
         )
     ]
-    
+
+    # Daftar semua varian (tanpa cek available)
+    list_text, list_markup, n_items = render_variant_page(mode_key, base, 0)
+    if n_items:
+        results.append(
+            InlineQueryResultArticle(
+                id=f"l{int(time.time())}",
+                title=f"Varian {base} ({mode_label})",
+                description=f"Tampilkan {n_items} varian username",
+                input_message_content=InputTextMessageContent(list_text),
+                reply_markup=list_markup
+            )
+        )
+
     await update.inline_query.answer(results, cache_time=1)
 
 # ================== CALLBACK QUERY HANDLER ==================
@@ -260,6 +768,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user.id in BANNED_USERS:
         await query.answer("❌ Anda telah dibanned dari bot ini.", show_alert=True)
+        return
+
+    # Admin membatalkan pantauan lewat tombol di /daftar
+    if data.startswith("stopwatch_"):
+        if user.id != ADMIN_ID:
+            await query.answer("Khusus admin", show_alert=True)
+            return
+        _, mode_key, base = data.split("_", 2)
+        ok = cancel_watch(mode_key, base)
+        await query.answer("Dibatalkan" if ok else "Sudah tidak aktif")
+        text, markup = render_watch_list()
+        try:
+            await query.message.edit_text(text, reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    # Daftar varian: ganti halaman / ganti set huruf
+    if data.startswith("vl_"):
+        try:
+            _, mode_key, rest = data.split("_", 2)
+            base, page_s = rest.rsplit("_", 1)
+            page = int(page_s)
+        except ValueError:
+            await query.answer()
+            return
+        if not is_valid_mode(mode_key) or not inline_msg_id:
+            await query.answer()
+            return
+        text, markup, _n = render_variant_page(mode_key, base, page)
+        try:
+            await context.bot.edit_message_text(
+                inline_message_id=inline_msg_id,
+                text=text,
+                reply_markup=markup
+            )
+        except Exception:
+            pass
+        await query.answer()
         return
 
     # Callback untuk Admin Menekan Tombol "Balas Pesan"
@@ -286,7 +833,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        gen_func, lbl = GENERATORS.get(mode_key, (gen_tamhur, "tamhur"))
+        gen_func, lbl = resolve_mode(mode_key) or (gen_tamhur, "tamhur")
         raw_res = gen_func(base)
         if mode_key == "uncommon":
             raw_res += gen_canon(base)
@@ -294,7 +841,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         candidates = list(set(raw_res))[:100]
         found_avail = []
         last_update_time = time.time()
-        
+
         sem = asyncio.Semaphore(max(1, len(available_clients)))
 
         async def worker(u):
@@ -307,12 +854,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
                     try:
                         await asyncio.sleep(random.uniform(0.2, 0.4))
-                        
+
                         ok = await asyncio.wait_for(
-                            c(functions.account.CheckUsernameRequest(u)), 
+                            c(functions.account.CheckUsernameRequest(u)),
                             timeout=4.0
                         )
-                        
+
                         if ok:
                             res_str = f"🟢 @{u}"
                             found_avail.append(res_str)
@@ -356,7 +903,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         pages = chunk_results(found_avail, chunk_size=15)
-        
+
         SCAN_CACHE[inline_msg_id] = {
             "pages": pages,
             "mode_label": lbl,
@@ -366,10 +913,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         page_text = (
             f"hasil scan untuk @{base} ({lbl})"
-            f" ada {len(found_avail)} usn\n\n" + 
+            f" ada {len(found_avail)} usn\n\n" +
             "\n".join(pages[0])
         )
-        
+
         reply_markup = build_pagination_keyboard(0, len(pages), base, mode_key)
 
         try:
@@ -400,7 +947,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         page_text = (
             f" hasil scan @{base} ({lbl}) ada  {sum(len(p) for p in pages)} usn\n"
-            f"{page_idx + 1}/{len(pages)}\n\n" + 
+            f"{page_idx + 1}/{len(pages)}\n\n" +
             "\n".join(pages[page_idx])
         )
 
@@ -419,7 +966,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== COMMAND HANDLERS & ADMIN BAN/UNBAN ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id in BANNED_USERS: 
+    if user.id in BANNED_USERS:
         return
     save_user(user.id)
     await notify_admin(context, user, "Menjalankan /start")
@@ -465,7 +1012,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         if "reply_to" in context.user_data:
             target_id = int(context.user_data.pop("reply_to"))
             try:
-                await context.bot.send_message(chat_id=target_id, text=f"💬 **Pesan dari Admin:**\n{msg_text}", parse_mode="Markdown")
+                await context.bot.send_message(chat_id=target_id, text=f"{msg_text}", parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Balasan berhasil dikirim ke `{target_id}`", parse_mode="Markdown")
             except Exception as e:
                 await update.message.reply_text(f"❌ Gagal mengirim pesan ke user: {e}")
@@ -478,7 +1025,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 try:
                     # Ambil User ID dari teks notifikasi
                     target_id = int(rep_text.split("ID:")[1].split()[0].replace("`", ""))
-                    await context.bot.send_message(chat_id=target_id, text=f"💬 **Pesan dari Admin:**\n{msg_text}", parse_mode="Markdown")
+                    await context.bot.send_message(chat_id=target_id, text=f"{msg_text}", parse_mode="Markdown")
                     await update.message.reply_text(f"✅ Balasan berhasil dikirim ke `{target_id}`", parse_mode="Markdown")
                     return
                 except Exception as e:
@@ -516,24 +1063,35 @@ async def post_init(application):
     await init_clients()
     logger.info(f"📊 Total akun aktif: {len(clients)} akun.")
 
+    # Lanjutkan pantauan yang tersimpan sebelum bot restart
+    if clients or WATCH_USE_WEB:
+        for (mode_key, base) in load_watchlist():
+            if is_valid_mode(mode_key):
+                start_watch(application, mode_key, base)
+                logger.info(f"♻️ Lanjut memantau {mode_key} {base}")
+
 def main():
     load_bans()
     load_users()
-    
+
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN tidak ditemukan di Environment Variable!")
         return
-        
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("unban", unban_user))
-    
+    app.add_handler(CommandHandler("pantau", pantau_cmd))
+    app.add_handler(CommandHandler("batal", batal_cmd))
+    app.add_handler(CommandHandler("daftar", daftar_cmd))
+    app.add_handler(CommandHandler("cek", cek_cmd))
+
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    
+
     # Handler pesan PM/PC (Private Chat)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message))
 
