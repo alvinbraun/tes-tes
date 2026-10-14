@@ -204,13 +204,17 @@ LETTER_SETS = {
     "vokal": vokal,
     "cadel": "wycl",
 }
-LETTER_LABELS = {"all": "semua", "rata": "rata", "tidakrata": "tidak rata", "vokal": "vokal", "cadel": "cadel"}
+LETTER_LABELS = {"all": "semua", "rata": "rata", "tidakrata": "tidak rata", "vokal": "vokal", "cadel": "cadel", "uncommon": "uncommon"}
 LETTER_MODES = ("tamping", "tamhur", "tamdal")
 
 def resolve_mode(mode_key):
-    """'tamping' atau 'tamping.rata' -> (fungsi_generator, label). None kalau tidak valid."""
+    """'tamping' atau 'tamping.rata' -> (fungsi_generator, label). None kalau tidak valid.
+    'tamping.uncommon' = pilihan uncommon di list varian tamping/tamhur/tamdal
+    (isinya sama dengan mode uncommon)."""
     if "." in mode_key:
         m, ls = mode_key.split(".", 1)
+        if m in LETTER_MODES and ls == "uncommon":
+            return GENERATORS["uncommon"]
         if m in LETTER_MODES and ls in LETTER_SETS:
             func, mlabel = GENERATORS[m]
             letters = LETTER_SETS[ls]
@@ -276,7 +280,7 @@ def build_candidates(mode_key, base, strict=True):
         return []
     gen_func, _ = resolve_mode(mode_key)
     raw = gen_func(base)
-    if mode_key == "uncommon":
+    if mode_key == "uncommon" or mode_key.endswith(".uncommon"):
         raw += gen_canon(base)
     pattern = USERNAME_RE if strict else USERNAME_LOOSE_RE
     result = []
@@ -577,7 +581,7 @@ def parse_mode_base(args):
     args = [a.lower().lstrip("@") for a in args if a]
     if not args:
         return None, None
-    if len(args) >= 3 and args[0] in LETTER_MODES and args[1] in LETTER_SETS:
+    if len(args) >= 3 and args[0] in LETTER_MODES and (args[1] in LETTER_SETS or args[1] == "uncommon"):
         return f"{args[0]}.{args[1]}", args[2]
     if len(args) >= 2 and is_valid_mode(args[0]):
         return args[0], args[1]
@@ -663,7 +667,10 @@ async def daftar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Batas karakter isi per halaman (limit Telegram 4096, sisanya buat header).
 # Username disambung dengan spasi tanpa \n, jadi base pendek = banyak per halaman,
 # base panjang = lebih sedikit per halaman.
-VL_CHAR_BUDGET = 3500
+VL_CHAR_BUDGET = 500
+
+# Mode yang bisa dipilih lewat tombol di hasil list varian
+VL_SWITCH_MODES = ("tamhur", "tamping", "tamdal", "uncommon", "ganhur")
 
 def paginate_variants(items):
     """Bagi varian ke halaman-halaman berdasarkan total karakter, bukan jumlah tetap."""
@@ -724,10 +731,27 @@ def variant_keyboard(mode_key, base, page, total_pages):
             rows.append([b for b in nav if b])
 
     base_mode = mode_key.split(".")[0]
-    if base_mode in LETTER_MODES:
+    # 'tamping.uncommon' isinya sama dengan uncommon, jadi ditandai sebagai uncommon
+    active_mode = "uncommon" if mode_key.endswith(".uncommon") else base_mode
+
+    # Baris pilihan mode: tamhur / tamping / tamdal / uncommon / ganhur
+    mbtns = []
+    for m in VL_SWITCH_MODES:
+        mdata = f"vl_{m}_{base}_0"
+        if len(mdata.encode()) > 64:
+            continue
+        label = GENERATORS[m][1]
+        mbtns.append(InlineKeyboardButton(f"• {label} •" if m == active_mode else label, callback_data=mdata))
+    for i in range(0, len(mbtns), 3):
+        rows.append(mbtns[i:i + 3])
+
+    # Pilihan set huruf, khusus mode tamping / tamhur / tamdal
+    if base_mode in LETTER_MODES and active_mode != "uncommon":
         cur = mode_key.split(".")[1] if "." in mode_key else "all"
         fbtns = []
         for key, label in LETTER_LABELS.items():
+            if key == "uncommon":
+                continue  # uncommon sudah ada di baris mode
             target = base_mode if key == "all" else f"{base_mode}.{key}"
             data = f"vl_{target}_{base}_0"
             if len(data.encode()) > 64:
@@ -790,8 +814,8 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = [
             InlineQueryResultArticle(
                 id=f"s{int(time.time())}",
-                title=f"List @{base} ({mode_label})",
-                description=f"Scan username @{base}",
+                title=f"Scan @{base} ({mode_label})",
+                description=f"Scan username @{base} (username checker)",
                 input_message_content=InputTextMessageContent(loading_text),
                 reply_markup=keyboard
             )
@@ -1082,7 +1106,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         if "reply_to" in context.user_data:
             target_id = int(context.user_data.pop("reply_to"))
             try:
-                await context.bot.send_message(chat_id=target_id, text=f"💬 **Pesan dari Admin:**\n{msg_text}", parse_mode="Markdown")
+                await context.bot.send_message(chat_id=target_id, text=f"{msg_text}", parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Balasan berhasil dikirim ke `{target_id}`", parse_mode="Markdown")
             except Exception as e:
                 await update.message.reply_text(f"❌ Gagal mengirim pesan ke user: {e}")
