@@ -46,15 +46,11 @@ USER_FILE = f"{DATA_DIR}users.txt"
 WATCH_FILE = f"{DATA_DIR}watch.txt"
 
 # Pengaturan pemantauan (bisa diubah lewat env)
+# /pantau selalu lewat web (t.me), TIDAK pakai akun Telethon.
+# Akun Telethon hanya dipakai untuk scan username available (inline) dan /cek.
 WATCH_INTERVAL = float(os.getenv("WATCH_INTERVAL", "20"))  # jeda antar putaran (detik)
 WATCH_DELAY_MIN = float(os.getenv("WATCH_DELAY_MIN", "1.0"))  # jeda antar cek username
 WATCH_DELAY_MAX = float(os.getenv("WATCH_DELAY_MAX", "2.0"))
-# 0 = rotasi semua akun, 1-20 = pantauan hanya pakai SESSION_n itu saja
-WATCH_ACCOUNT = int(os.getenv("WATCH_ACCOUNT", "0"))
-# 1 = langsung keep (bikin channel publik), 0 = cuma kirim notif
-WATCH_AUTOCLAIM = os.getenv("WATCH_AUTOCLAIM", "0") == "1"
-# 1 = pantau tanpa akun sama sekali (cek halaman t.me lewat HTTP), cuma bisa notif
-WATCH_USE_WEB = os.getenv("WATCH_USE_WEB", "0") == "1"
 
 BANNED_USERS = set()
 clients = []
@@ -271,7 +267,7 @@ def build_pagination_keyboard(current_page, total_pages, target_base, mode_key):
 
     return InlineKeyboardMarkup([buttons])
 
-# ================== USERNAME WATCHER (ADMIN ONLY) ==================
+# ================== USERNAME WATCHER (ADMIN ONLY, WEB ONLY) ==================
 def build_candidates(mode_key, base, strict=True):
     """strict=True  -> untuk scan/pantau (cek available): ada minimal huruf
                        (base min 4, ganhur/switch min 5, hasil min 5 karakter).
@@ -294,150 +290,7 @@ def build_candidates(mode_key, base, strict=True):
         result.append(u)
     return result
 
-async def wait_client():
-    while True:
-        if WATCH_ACCOUNT:
-            c = next((x for x in clients if client_acc.get(x) == WATCH_ACCOUNT), None)
-            if c and client_cooldown[c] <= time.time():
-                return c
-        else:
-            c = get_available_client()
-            if c:
-                return c
-        await asyncio.sleep(5)
-
-async def wait_watch_client():
-    """Kalau WATCH_ACCOUNT diisi, selalu pakai akun itu (nunggu kalau lagi cooldown)."""
-    if WATCH_ACCOUNT:
-        c = CLIENT_BY_SLOT.get(WATCH_ACCOUNT)
-        if c:
-            while client_cooldown[c] > time.time():
-                await asyncio.sleep(5)
-            return c
-        logger.warning(f"WATCH_ACCOUNT={WATCH_ACCOUNT} tidak aktif, pakai rotasi akun.")
-    return await wait_client()
-
-async def claim_username(c, u):
-    """Keep username: bikin channel publik dengan username tsb di akun c."""
-    ch = None
-    try:
-        res = await c(functions.channels.CreateChannelRequest(
-            title=u, about="", broadcast=True
-        ))
-        ch = res.chats[0]
-        await c(functions.channels.UpdateUsernameRequest(channel=ch, username=u))
-        return True, ""
-    except FloodWaitError as e:
-        client_cooldown[c] = time.time() + e.seconds + 5
-        err = f"FloodWait {e.seconds}s"
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-
-    # Gagal set username -> hapus channel kosong yang sempat dibuat
-    if ch is not None:
-        try:
-            await c(functions.channels.DeleteChannelRequest(channel=ch))
-        except Exception:
-            pass
-    return False, err
-
-async def watch_loop(app, mode_key, base):
-    key = (mode_key, base)
-    lbl = resolve_mode(mode_key)[1]
-    candidates = build_candidates(mode_key, base)
-    claim_fail_notified = set()
-
-    if not candidates:
-        await app.bot.send_message(
-            ADMIN_ID,
-            f"❌ Tidak ada variasi valid untuk @{base} ({lbl}). "
-            f"Minimal {min_base_len(mode_key)} huruf untuk mode ini."
-        )
-        WATCHERS.pop(key, None)
-        save_watchlist()
-        return
-
-    logger.info(f"👁️ Mulai memantau @{base} ({lbl}) - {len(candidates)} variasi")
-
-    try:
-        while True:
-            if not clients:
-                await asyncio.sleep(30)
-                continue
-
-            for u in candidates:
-                available = False
-                # cek satu username, ulangi kalau akun kena limit
-                for _ in range(5):
-                    c = await wait_watch_client()
-                    try:
-                        available = await asyncio.wait_for(
-                            c(functions.account.CheckUsernameRequest(u)), timeout=8.0
-                        )
-                        break
-                    except FloodWaitError as e:
-                        logger.warning(f"⚠️ FloodWait {e.seconds}s (watch @{base})")
-                        client_cooldown[c] = time.time() + e.seconds + 5
-                        continue
-                    except asyncio.TimeoutError:
-                        client_cooldown[c] = time.time() + 10
-                        continue
-                    except Exception:
-                        available = False
-                        break
-
-                if available and not WATCH_AUTOCLAIM:
-                    await app.bot.send_message(
-                        ADMIN_ID,
-                        f"🟢 @{u} available!\n"
-                        f"Dari pantauan: {lbl} {base}\n"
-                        f"Buruan ambil. Pantauan ini dihentikan."
-                    )
-                    WATCHERS.pop(key, None)
-                    save_watchlist()
-                    return
-
-                if available:
-                    ok, err = await claim_username(c, u)
-                    acc_no = client_acc.get(c, "?")
-                    if ok:
-                        await app.bot.send_message(
-                            ADMIN_ID,
-                            f"✅ Berhasil keep @{u}\n"
-                            f"Dari pantauan: {lbl} {base}\n"
-                            f"Akun: acc{acc_no} (dibuat sebagai channel publik)\n"
-                            f"Pantauan ini dihentikan."
-                        )
-                        WATCHERS.pop(key, None)
-                        save_watchlist()
-                        return
-                    else:
-                        logger.warning(f"Gagal keep @{u}: {err}")
-                        if u not in claim_fail_notified:
-                            claim_fail_notified.add(u)
-                            await app.bot.send_message(
-                                ADMIN_ID,
-                                f"⚠️ @{u} available tapi gagal di-keep oleh acc{acc_no}.\n"
-                                f"Alasan: {err}\n"
-                                f"Pantauan tetap jalan."
-                            )
-
-                await asyncio.sleep(random.uniform(WATCH_DELAY_MIN, WATCH_DELAY_MAX))
-
-            await asyncio.sleep(WATCH_INTERVAL)
-    except asyncio.CancelledError:
-        logger.info(f"🛑 Pantauan @{base} ({lbl}) dibatalkan")
-        raise
-    except Exception as e:
-        logger.error(f"Watcher @{base} ({lbl}) error: {e}")
-        WATCHERS.pop(key, None)
-        save_watchlist()
-        try:
-            await app.bot.send_message(ADMIN_ID, f"❌ Pantauan {lbl} {base} berhenti karena error: {e}")
-        except Exception:
-            pass
-
-# ---------- Mode web (tanpa akun) ----------
+# ---------- Pantauan lewat web (tanpa akun Telethon) ----------
 WEB_CLIENT = None
 
 def get_web_client():
@@ -471,9 +324,13 @@ async def check_web(u):
     return "free"
 
 async def watch_loop_web(app, mode_key, base):
+    """Pantau terus-menerus lewat web. Kirim notif tiap ada yang available,
+    tapi pantauan TIDAK berhenti sampai admin /batal."""
     key = (mode_key, base)
     lbl = resolve_mode(mode_key)[1]
     candidates = build_candidates(mode_key, base)
+    notified = set()  # username yang sudah dinotif sebagai available
+    stop_cmd = f"/batal {mode_key.replace('.', ' ')} {base}"
 
     if not candidates:
         await app.bot.send_message(
@@ -498,20 +355,24 @@ async def watch_loop_web(app, mode_key, base):
                     logger.warning("⚠️ t.me rate limit, nunggu 60 detik")
                     await asyncio.sleep(60)
 
-                if state == "free":
+                if state == "free" and u not in notified:
                     # cek ulang sekali biar tidak salah notif
                     await asyncio.sleep(random.uniform(2, 4))
                     if await check_web(u) == "free":
-                        await app.bot.send_message(
-                            ADMIN_ID,
-                            f"🟢 @{u} kelihatannya available!\n"
-                            f"Dari pantauan: {lbl} {base}\n"
-                            f"(dicek lewat web, belum tentu bisa diambil, coba langsung)\n"
-                            f"Pantauan ini dihentikan."
-                        )
-                        WATCHERS.pop(key, None)
-                        save_watchlist()
-                        return
+                        notified.add(u)
+                        try:
+                            await app.bot.send_message(
+                                ADMIN_ID,
+                                f"🟢 @{u} kelihatannya available!\n"
+                                f"Dari pantauan: {lbl} {base}\n"
+                                f"(dicek lewat web, belum tentu bisa diambil, coba langsung)\n"
+                                f"Pantauan tetap jalan. Stop: {stop_cmd}"
+                            )
+                        except Exception as e:
+                            logger.error(f"Gagal kirim notif available: {e}")
+                elif state == "taken" and u in notified:
+                    # sudah diambil lagi -> kalau nanti kosong lagi, dinotif ulang
+                    notified.discard(u)
 
                 await asyncio.sleep(random.uniform(WATCH_DELAY_MIN, WATCH_DELAY_MAX))
 
@@ -547,13 +408,32 @@ async def cek_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"\nAkun: error {type(e).__name__}"
     await update.message.reply_text(text)
 
+async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/limit : lihat status cooldown tiap akun Telethon."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not clients:
+        await update.message.reply_text("❌ Tidak ada akun Telethon yang aktif (cek SESSION_n / API_ID / API_HASH).")
+        return
+    now = time.time()
+    lines = []
+    for c in clients:
+        sisa = int(client_cooldown[c] - now)
+        acc = client_acc.get(c, "?")
+        if sisa <= 0:
+            lines.append(f"acc{acc}: ✅ ready")
+        else:
+            h, rem = divmod(sisa, 3600)
+            m, s = divmod(rem, 60)
+            lines.append(f"acc{acc}: ⏳ limit {h}j {m}m {s}d lagi")
+    await update.message.reply_text("\n".join(lines))
+
 def start_watch(app, mode_key, base):
     key = (mode_key, base)
     task = WATCHERS.get(key)
     if task and not task.done():
         return False
-    loop_fn = watch_loop_web if WATCH_USE_WEB else watch_loop
-    WATCHERS[key] = asyncio.create_task(loop_fn(app, mode_key, base))
+    WATCHERS[key] = asyncio.create_task(watch_loop_web(app, mode_key, base))
     save_watchlist()
     return True
 
@@ -598,16 +478,9 @@ async def pantau_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Mode: " + ", ".join(GENERATORS.keys()) + "\n"
             "Pilihan huruf (tamping/tamhur/tamdal): rata, tidakrata, vokal, cadel\n"
             "Contoh: /pantau tamping rata adnan\n"
-            "Minimal huruf: ganhur & switch 5, mode lain 4"
+            "Minimal huruf: ganhur & switch 5, mode lain 4\n"
+            "Pantauan lewat web (tanpa akun), jalan terus sampai kamu /batal."
         )
-        return
-
-    if not clients and not WATCH_USE_WEB:
-        await update.message.reply_text("❌ Belum ada akun Telethon yang aktif.")
-        return
-
-    if WATCH_ACCOUNT and not any(client_acc.get(c) == WATCH_ACCOUNT for c in clients):
-        await update.message.reply_text(f"❌ SESSION_{WATCH_ACCOUNT} tidak aktif / gagal login.")
         return
 
     min_len = min_base_len(mode_key)
@@ -625,8 +498,8 @@ async def pantau_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if start_watch(context.application, mode_key, base):
         await update.message.reply_text(
-            f"👁️ Mulai memantau {mode_key.replace('.', ' ')} {base} ({total} variasi).\n"
-            f"Kalau ada yang available {'langsung dikeep' if (WATCH_AUTOCLAIM and not WATCH_USE_WEB) else 'kamu dapat notif'}.\n"
+            f"👁️ Mulai memantau {mode_key.replace('.', ' ')} {base} ({total} variasi) lewat web.\n"
+            f"Kamu dapat notif tiap ada yang available, pantauan jalan terus sampai kamu stop.\n"
             f"Batalin: /batal {mode_key.replace('.', ' ')} {base}"
         )
     else:
@@ -1191,16 +1064,16 @@ async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ================== POST INIT & MAIN ==================
 async def post_init(application):
-    logger.info("⚙️ Inisialisasi Telethon sessions...")
+    logger.info("⚙️ Inisialisasi Telethon sessions (untuk scan & /cek)...")
     await init_clients()
     logger.info(f"📊 Total akun aktif: {len(clients)} akun.")
 
-    # Lanjutkan pantauan yang tersimpan sebelum bot restart
-    if clients or WATCH_USE_WEB:
-        for (mode_key, base) in load_watchlist():
-            if is_valid_mode(mode_key):
-                start_watch(application, mode_key, base)
-                logger.info(f"♻️ Lanjut memantau {mode_key} {base}")
+    # Lanjutkan pantauan (web) yang tersimpan sebelum bot restart.
+    # Tidak butuh akun Telethon.
+    for (mode_key, base) in load_watchlist():
+        if is_valid_mode(mode_key):
+            start_watch(application, mode_key, base)
+            logger.info(f"♻️ Lanjut memantau {mode_key} {base}")
 
 def main():
     load_bans()
@@ -1220,6 +1093,7 @@ def main():
     app.add_handler(CommandHandler("batal", batal_cmd))
     app.add_handler(CommandHandler("daftar", daftar_cmd))
     app.add_handler(CommandHandler("cek", cek_cmd))
+    app.add_handler(CommandHandler("limit", limit_cmd))
 
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(CallbackQueryHandler(handle_callback))
