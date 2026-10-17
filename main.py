@@ -44,7 +44,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # [TAMBAHAN] Channel yang dipantau untuk auto-ban saat user left (bot harus admin di channel ini)
-AUTOBAN_CHANNELS = {-1003882339899}
+AUTOBAN_CHANNELS = {-1003870610445}
 
 DATA_DIR = "./"
 BAN_FILE = f"{DATA_DIR}banned.txt"
