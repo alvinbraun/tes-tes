@@ -33,12 +33,18 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     InlineQueryHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
+# [TAMBAHAN] untuk fitur auto-ban saat left channel
+from telegram import ChatMember
+from telegram.ext import ChatMemberHandler
 
 # Configuration from Environment Variables
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+# [TAMBAHAN] Channel yang dipantau untuk auto-ban saat user left (bot harus admin di channel ini)
+AUTOBAN_CHANNELS = {-1003882339899}
 
 DATA_DIR = "./"
 BAN_FILE = f"{DATA_DIR}banned.txt"
@@ -1062,6 +1068,40 @@ async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Gagal kirim notif reply GC: {e}")
 
+# ================== [TAMBAHAN] AUTO BAN SAAT LEFT CHANNEL ==================
+async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = update.chat_member
+    if not cmu:
+        return
+
+    chat = cmu.chat
+    if chat.type != "channel" or chat.id not in AUTOBAN_CHANNELS:
+        return
+
+    target = cmu.new_chat_member.user
+    if target.is_bot or target.id == ADMIN_ID:
+        return
+
+    old = cmu.old_chat_member
+    new = cmu.new_chat_member
+
+    # sebelumnya member (atau restricted tapi masih member), sekarang left
+    was_member = old.status == ChatMember.MEMBER or (
+        old.status == ChatMember.RESTRICTED and getattr(old, "is_member", False)
+    )
+    left_now = new.status == ChatMember.LEFT
+    voluntary = cmu.from_user.id == target.id  # left sendiri, bukan di-kick admin
+
+    if not (was_member and left_now and voluntary):
+        return
+
+    if target.id in BANNED_USERS:
+        return
+
+    # ban di bot, tanpa notifikasi ke admin
+    save_ban(target.id)
+    logger.info(f"🚫 Auto-ban {target.id} (left {chat.title or chat.id})")
+
 # ================== POST INIT & MAIN ==================
 async def post_init(application):
     logger.info("⚙️ Inisialisasi Telethon sessions (untuk scan & /cek)...")
@@ -1108,8 +1148,15 @@ def main():
     ))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.REPLY & ~filters.COMMAND, handle_group_reply))
 
+    # [TAMBAHAN] Auto-ban user yang left channel
+    app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
+
     logger.info("🚀 Bot berjalan...")
-    app.run_polling(drop_pending_updates=True)
+    # [DIUBAH] ditambah allowed_updates supaya update chat_member diterima
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "inline_query", "callback_query", "chat_member"],
+    )
 
 if __name__ == "__main__":
     main()
