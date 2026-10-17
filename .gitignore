@@ -1,8 +1,12 @@
 .env
 *.session
 *.session-journal
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# data runtime bot (jangan di-commit)
 banned.txt
 users.txt
 watch.txt
-__pycache__/
-*.pyc
